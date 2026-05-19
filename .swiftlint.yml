@@ -1,0 +1,12 @@
+disabled_rules:
+  - trailing_whitespace
+
+opt_in_rules:
+  - empty_count
+
+line_length: 120
+
+excluded:
+  - Pods
+  - DerivedData
+  - vendor
