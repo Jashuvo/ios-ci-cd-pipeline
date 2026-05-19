@@ -1,0 +1,429 @@
+name: iOS Build & Release
+
+# ─────────────────────────────────────────────────────────────
+#  TRIGGERS
+#  • push to main  → Internal TestFlight (QA / team testers)
+#  • push of a version tag (v*.*.*) → Full release pipeline
+#  • manual dispatch → choose target environment
+# ─────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment target"
+        required: true
+        default: "testflight_internal"
+        type: choice
+        options:
+          - testflight_internal
+          - testflight_external
+          - appstore
+
+# Cancel any in-progress run for the same ref so we never
+# upload two builds from the same commit simultaneously.
+concurrency:
+  group: ios-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ── Xcode project settings ──────────────────────────────────
+  XCODE_PROJECT: "YourApp.xcodeproj"   # ← change to your project/workspace name
+  XCODE_SCHEME: "YourApp"             # ← change to your scheme
+  XCODE_CONFIGURATION: "Release"
+  DERIVED_DATA_PATH: "DerivedData"
+  ARCHIVE_PATH: "build/YourApp.xcarchive"
+  EXPORT_PATH: "build/ipa"
+
+  # ── Fastlane Match (code signing) ───────────────────────────
+  MATCH_TYPE: "appstore"              # appstore | adhoc | development
+  MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}   # private repo with certs/profiles
+
+  # ── App Store Connect API ────────────────────────────────────
+  APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+  APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════
+  #  JOB 1 — LINT & UNIT TESTS
+  #  Pipeline fails fast here; no artifact is ever built
+  #  if quality checks do not pass.
+  # ═══════════════════════════════════════════════════════════
+  lint_and_test:
+    name: "SwiftLint & XCTest"
+    runs-on: macos-14        # Xcode 15+
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── SwiftLint ──────────────────────────────────────────
+      - name: Install SwiftLint
+        run: brew install swiftlint
+
+      - name: Run SwiftLint
+        run: swiftlint lint --strict --reporter github-actions-logging
+        # --strict → treat warnings as errors
+        # --reporter github-actions-logging → annotates PR diff inline
+
+      # ── Unit Tests (XCTest) ────────────────────────────────
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,name=iPhone 15,OS=latest" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -resultBundlePath TestResults.xcresult \
+            | xcpretty --report junit --output test-results.xml
+
+      - name: Upload test results
+        if: always()   # upload even on failure so the report is always available
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 14
+
+
+  # ═══════════════════════════════════════════════════════════
+  #  JOB 2 — BUILD & SIGN
+  #  Runs only after lint_and_test passes.
+  #  Produces a signed .ipa ready for distribution.
+  # ═══════════════════════════════════════════════════════════
+  build_and_sign:
+    name: "Build & Sign IPA"
+    runs-on: macos-14
+    needs: lint_and_test
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── Versioning ─────────────────────────────────────────
+      # Section 1 of the documented process:
+      #   CFBundleShortVersionString → read from the git tag (e.g. "1.2.3")
+      #   CFBundleVersion            → use the unique CI run number (auto-increments)
+      - name: Set version numbers
+        run: |
+          # Marketing version: strip leading "v" from tag, or fall back to "0.0.0"
+          VERSION_NAME="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            VERSION_NAME=$(agvtool what-marketing-version -terse1)
+          fi
+
+          BUILD_NUMBER=${{ github.run_number }}
+
+          echo "Setting Version → $VERSION_NAME  |  Build → $BUILD_NUMBER"
+
+          # agvtool writes directly into the project's Info.plist / project.pbxproj
+          agvtool new-marketing-version "$VERSION_NAME"
+          agvtool new-version -all "$BUILD_NUMBER"
+
+      # ── Code Signing via Fastlane Match ────────────────────
+      # Section 2 of the documented process:
+      #   Match fetches the correct Apple Distribution Certificate
+      #   and App Store Provisioning Profile from the private git
+      #   repository and installs them on this CI runner.
+      - name: Set up Ruby & Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true   # caches gems between runs
+
+      - name: Sync certificates & profiles (Fastlane Match)
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}        # repo encryption passphrase
+          GIT_PRIVATE_KEY: ${{ secrets.MATCH_GIT_PRIVATE_KEY }} # SSH key for the certs repo
+        run: |
+          # Write the SSH key so Match can clone the private cert repo
+          mkdir -p ~/.ssh
+          echo "$GIT_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          bundle exec fastlane match appstore \
+            --readonly true \
+            --git_url "$MATCH_GIT_URL"
+          # --readonly: never regenerate certs mid-pipeline; fail loudly instead
+
+      # ── Archive (xcodebuild) ───────────────────────────────
+      # Section 3, step 1 of the documented process
+      - name: Build archive
+        run: |
+          xcodebuild archive \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration "$XCODE_CONFIGURATION" \
+            -archivePath "$ARCHIVE_PATH" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            | xcpretty
+
+      # ── Export IPA ─────────────────────────────────────────
+      # Section 3, step 2 of the documented process
+      # exportOptions.plist must be committed to your repo at the path below.
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist "fastlane/ExportOptions.plist" \
+            | xcpretty
+          # ExportOptions.plist must specify:
+          #   method           → app-store
+          #   teamID           → your Apple Team ID
+          #   signingStyle     → manual
+          #   provisioningProfiles → { bundleId: profileName }
+
+      # ── dSYM upload (crash symbolication) ─────────────────
+      # Section 6 (Additional Practices) of the documented process.
+      # Uploads the symbol files so crash reporters can de-obfuscate
+      # stack traces from production crashes.
+      - name: Upload dSYMs to crash reporter
+        run: |
+          # Example: Firebase Crashlytics via Fastlane
+          bundle exec fastlane run upload_symbols_to_crashlytics \
+            dsym_path:"$ARCHIVE_PATH/dSYMs" \
+            gsp_path:"YourApp/GoogleService-Info.plist"
+        continue-on-error: true   # never block the release for a symbolication hiccup
+
+      # ── Stash the IPA for the next job ────────────────────
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-ipa
+          path: ${{ env.EXPORT_PATH }}/*.ipa
+          retention-days: 7
+
+      # ── Stash What's New text ─────────────────────────────
+      # Section 3 (Release Notes) of the documented process.
+      # Commit a plain-text file at fastlane/metadata/en-US/release_notes.txt
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: fastlane/metadata/en-US/release_notes.txt
+
+
+  # ═══════════════════════════════════════════════════════════
+  #  JOB 3 — UPLOAD TO TESTFLIGHT (INTERNAL)
+  #  Runs automatically on every push to main (or manual run).
+  #  Does NOT require App Review — QA can install immediately.
+  # ═══════════════════════════════════════════════════════════
+  deploy_testflight_internal:
+    name: "Deploy → TestFlight Internal"
+    runs-on: macos-14
+    needs: build_and_sign
+
+    # Run when: push to main (no tag) OR manual dispatch targeting internal
+    if: |
+      (github.ref == 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'testflight_internal')
+
+    environment: testflight-internal   # optional: gate behind required reviewers in GitHub
+
+    steps:
+      - name: Checkout (for Fastlane)
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby & Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+
+      - name: Download signed IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-ipa
+          path: build/ipa
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: fastlane/metadata/en-US
+
+      # ── Authentication via App Store Connect API ───────────
+      # Section 4 of the documented process:
+      #   Uses a .p8 API key (no 2FA prompts) with App Manager role.
+      #   The key contents, Key ID, and Issuer ID are stored as
+      #   encrypted secrets and never appear in logs.
+      - name: Write App Store Connect API key
+        env:
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_P8_CONTENT }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_KEY_CONTENT" > \
+            ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          chmod 600 ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+      # ── Upload & Distribute (Fastlane Pilot) ──────────────
+      - name: Upload to TestFlight (Internal)
+        run: |
+          bundle exec fastlane pilot upload \
+            --api_key_path "~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8" \
+            --issuer_id "${{ secrets.ASC_ISSUER_ID }}" \
+            --key_id "${{ secrets.ASC_KEY_ID }}" \
+            --ipa "$(ls build/ipa/*.ipa | head -1)" \
+            --changelog "$(cat fastlane/metadata/en-US/release_notes.txt)" \
+            --distribute_external false \
+            --notify_external_testers false \
+            --skip_submission false
+
+      - name: Notify team (Slack)
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ *iOS Internal TestFlight build uploaded*\nBranch: `${{ github.ref_name }}`  |  Build: `#${{ github.run_number }}`\nTesters can install now via TestFlight."
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+
+  # ═══════════════════════════════════════════════════════════
+  #  JOB 4 — PROMOTE TO TESTFLIGHT (EXTERNAL BETA)
+  #  Triggered by a version tag push or manual dispatch.
+  #  Requires an initial App Review by Apple (~24–48 h).
+  # ═══════════════════════════════════════════════════════════
+  deploy_testflight_external:
+    name: "Deploy → TestFlight External"
+    runs-on: macos-14
+    needs: build_and_sign
+
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'testflight_external')
+
+    environment: testflight-external   # require a manual approval in GitHub before proceeding
+
+    steps:
+      - name: Checkout (for Fastlane)
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby & Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+
+      - name: Download signed IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-ipa
+          path: build/ipa
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: fastlane/metadata/en-US
+
+      - name: Write App Store Connect API key
+        env:
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_P8_CONTENT }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_KEY_CONTENT" > \
+            ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          chmod 600 ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+      - name: Distribute to External Beta Testers
+        run: |
+          bundle exec fastlane pilot upload \
+            --api_key_path "~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8" \
+            --issuer_id "${{ secrets.ASC_ISSUER_ID }}" \
+            --key_id "${{ secrets.ASC_KEY_ID }}" \
+            --ipa "$(ls build/ipa/*.ipa | head -1)" \
+            --changelog "$(cat fastlane/metadata/en-US/release_notes.txt)" \
+            --distribute_external true \
+            --notify_external_testers true \
+            --groups "External Beta"
+          # "External Beta" is the name of your external group in App Store Connect.
+          # Apple will begin a brief App Review for the first submission to this group.
+
+
+  # ═══════════════════════════════════════════════════════════
+  #  JOB 5 — SUBMIT TO APP STORE (PRODUCTION)
+  #  Requires a manual "Approve" gate in the GitHub
+  #  "appstore" environment before running.
+  #  Enables Phased Release so the rollout happens over 7 days.
+  # ═══════════════════════════════════════════════════════════
+  deploy_appstore:
+    name: "Deploy → App Store (Phased Release)"
+    runs-on: macos-14
+    needs: deploy_testflight_external
+
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'appstore')
+
+    environment: appstore   # REQUIRED: set up a protection rule + required reviewers here
+
+    steps:
+      - name: Checkout (for Fastlane)
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby & Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: fastlane/metadata/en-US
+
+      - name: Write App Store Connect API key
+        env:
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_P8_CONTENT }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_KEY_CONTENT" > \
+            ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+          chmod 600 ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+      # ── Submit the already-reviewed TestFlight build ───────
+      # Section 5 of the documented process:
+      #   Promotes a verified TestFlight build to App Store Review
+      #   and enables Phased Release (gradual 7-day rollout).
+      - name: Submit for App Store Review
+        run: |
+          bundle exec fastlane deliver \
+            --api_key_path "~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8" \
+            --issuer_id "${{ secrets.ASC_ISSUER_ID }}" \
+            --key_id "${{ secrets.ASC_KEY_ID }}" \
+            --app_version "$(agvtool what-marketing-version -terse1)" \
+            --release_notes "{ 'default' => '$(cat fastlane/metadata/en-US/release_notes.txt)' }" \
+            --phased_release true \
+            --automatic_release false \
+            --submit_for_review true \
+            --skip_binary_upload true
+          # --skip_binary_upload: the IPA is already on App Store Connect via pilot (Job 4)
+          # --phased_release true: Apple rolls out over 7 days (can be halted in ASC)
+          # --automatic_release false: you manually click "Release This Version" in ASC
+
+      - name: Notify team (Slack)
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚀 *iOS App Store submission triggered*\nVersion: `${{ github.ref_name }}`\nPhased release enabled — Apple review in progress."
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
