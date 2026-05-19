@@ -1,0 +1,5 @@
+What's New
+
+- Performance improvements and bug fixes
+- Updated UI for better accessibility
+- Stability improvements across all devices
